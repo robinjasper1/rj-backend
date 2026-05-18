@@ -31,7 +31,7 @@ app.use(cors({
 app.use(express.json());
 
 // ── Massive API base + key from environment variable
-const MASSIVE_BASE = "https://api.massive.com/v3";
+const MASSIVE_BASE = "https://api.massive.com";
 const MASSIVE_KEY  = process.env.MASSIVE_API_KEY;
 
 if (!MASSIVE_KEY) {
@@ -70,14 +70,13 @@ function etYesterday() {
 
 // ─────────────────────────────────────────────
 // ROUTE 1 — GET /api/gappers
-// Returns top 20 premarket gappers under $500M
-// market cap, sorted by gap % descending.
-// Uses Massive full market snapshot endpoint.
+// Uses Massive Top Market Movers endpoint —
+// returns top 20 gainers directly, no filtering.
+// Cleared at 3:30am ET, repopulates from 4am ET.
 // ─────────────────────────────────────────────
 app.get("/api/gappers", async (req, res) => {
   try {
-    // Full market snapshot — all US tickers in one call
-    const url = `${MASSIVE_BASE}/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${MASSIVE_KEY}`;
+    const url = `${MASSIVE_BASE}/v2/snapshot/locale/us/markets/stocks/gainers?apiKey=${MASSIVE_KEY}`;
     const r   = await fetch(url, {
       headers: { "Authorization": `Bearer ${MASSIVE_KEY}` }
     });
@@ -87,30 +86,23 @@ app.get("/api/gappers", async (req, res) => {
     const tickers = data.tickers || data.results || [];
 
     const results = tickers
-      .filter(s => {
-        const chgPct = s.todaysChangePerc || 0;
-        const vol    = s.day?.v || s.min?.v || 0;
-        // Keep positive gappers with meaningful volume
-        return chgPct > 2 && vol > 100_000 && s.ticker && s.ticker.length <= 5;
-      })
-      .sort((a, b) => (b.todaysChangePerc || 0) - (a.todaysChangePerc || 0))
-      .slice(0, 20)
+      .filter(s => s.ticker && s.ticker.length <= 5 && /^[A-Z]+$/.test(s.ticker))
       .map((s, i) => ({
         rank:          i + 1,
         sym:           s.ticker,
         price:         s.lastTrade?.p || s.day?.c || null,
-        open:          s.day?.o || null,
-        prevClose:     s.prevDay?.c || null,
-        high:          s.day?.h || null,
-        low:           s.day?.l || null,
-        volume:        s.day?.v || s.min?.v || null,
+        open:          s.day?.o       || null,
+        prevClose:     s.prevDay?.c   || null,
+        high:          s.day?.h       || null,
+        low:           s.day?.l       || null,
+        volume:        s.day?.v       || s.min?.v || null,
         changePercent: s.todaysChangePerc || null,
-        marketCap:     null, // snapshot doesn't include mktcap — enriched later if needed
+        marketCap:     null,
         float:         null,
         rvol:          null,
       }));
 
-    res.json({ ok: true, data: results, timestamp: Date.now() });
+    res.json({ ok: true, data: results, count: results.length, timestamp: Date.now() });
 
   } catch (err) {
     console.error("GET /api/gappers error:", err.message);
