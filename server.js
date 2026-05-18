@@ -69,6 +69,27 @@ function etYesterday() {
 }
 
 // ─────────────────────────────────────────────
+// DEBUG — GET /api/debug
+// Shows exact URL being called + raw response
+// from Massive. Remove after fixing endpoints.
+// ─────────────────────────────────────────────
+app.get("/api/debug", async (req, res) => {
+  const testUrl = `${MASSIVE_BASE}/v2/snapshot/locale/us/markets/stocks/gainers?apiKey=${MASSIVE_KEY}`;
+  try {
+    const r    = await fetch(testUrl, { headers: { "Authorization": `Bearer ${MASSIVE_KEY}` } });
+    const text = await r.text();
+    res.json({
+      urlCalled:  testUrl.replace(MASSIVE_KEY, "KEY_HIDDEN"),
+      status:     r.status,
+      statusText: r.statusText,
+      body:       text.slice(0, 500), // first 500 chars of response
+    });
+  } catch(e) {
+    res.json({ urlCalled: testUrl.replace(MASSIVE_KEY,"KEY_HIDDEN"), error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 // ROUTE 1 — GET /api/gappers
 // Uses Massive Top Market Movers endpoint —
 // returns top 20 gainers directly, no filtering.
