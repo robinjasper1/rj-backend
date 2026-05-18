@@ -72,43 +72,42 @@ function etYesterday() {
 // ROUTE 1 — GET /api/gappers
 // Returns top 20 premarket gappers under $500M
 // market cap, sorted by gap % descending.
-// Called every 5 minutes by the frontend.
+// Uses Massive full market snapshot endpoint.
 // ─────────────────────────────────────────────
 app.get("/api/gappers", async (req, res) => {
   try {
-    const today = etToday();
-
-    // Massive snapshot endpoint — US stocks with premarket data
-    // Returns tickers with pm change %, volume, market cap
-    const data = await massiveFetch("/stocks/snapshots", {
-      date:     today,
-      market:   "premarket",
-      sort:     "changePercent",
-      order:    "desc",
-      limit:    100,
-      exchange: "US",
+    // Full market snapshot — all US tickers in one call
+    const url = `${MASSIVE_BASE}/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${MASSIVE_KEY}`;
+    const r   = await fetch(url, {
+      headers: { "Authorization": `Bearer ${MASSIVE_KEY}` }
     });
+    if (!r.ok) throw new Error(`Massive ${r.status}: ${await r.text()}`);
+    const data = await r.json();
 
-    const results = (data.results || data.data || data || [])
-      .filter(s =>
-        s.marketCap && s.marketCap < 500_000_000 &&   // under $500M
-        s.changePercent > 0 &&                         // positive gap
-        s.symbol && s.symbol.length <= 5               // valid ticker
-      )
+    const tickers = data.tickers || data.results || [];
+
+    const results = tickers
+      .filter(s => {
+        const chgPct = s.todaysChangePerc || 0;
+        const vol    = s.day?.v || s.min?.v || 0;
+        // Keep positive gappers with meaningful volume
+        return chgPct > 2 && vol > 100_000 && s.ticker && s.ticker.length <= 5;
+      })
+      .sort((a, b) => (b.todaysChangePerc || 0) - (a.todaysChangePerc || 0))
       .slice(0, 20)
       .map((s, i) => ({
         rank:          i + 1,
-        sym:           s.symbol,
-        price:         s.price         || s.lastPrice  || null,
-        open:          s.open          || null,
-        prevClose:     s.prevClose     || s.previousClose || null,
-        high:          s.high          || null,
-        low:           s.low           || null,
-        volume:        s.volume        || s.preMarketVolume || null,
-        changePercent: s.changePercent || null,
-        marketCap:     s.marketCap     || null,
-        float:         s.float         || null,
-        rvol:          s.rvol          || s.relativeVolume || null,
+        sym:           s.ticker,
+        price:         s.lastTrade?.p || s.day?.c || null,
+        open:          s.day?.o || null,
+        prevClose:     s.prevDay?.c || null,
+        high:          s.day?.h || null,
+        low:           s.day?.l || null,
+        volume:        s.day?.v || s.min?.v || null,
+        changePercent: s.todaysChangePerc || null,
+        marketCap:     null, // snapshot doesn't include mktcap — enriched later if needed
+        float:         null,
+        rvol:          null,
       }));
 
     res.json({ ok: true, data: results, timestamp: Date.now() });
@@ -121,32 +120,34 @@ app.get("/api/gappers", async (req, res) => {
 
 // ─────────────────────────────────────────────
 // ROUTE 2 — GET /api/quote/:symbol
-// Real-time quote for a single ticker.
-// Returns price, open, prevClose, high, volume.
+// Real-time snapshot for a single ticker.
 // ─────────────────────────────────────────────
 app.get("/api/quote/:symbol", async (req, res) => {
   try {
-    const sym  = req.params.symbol.toUpperCase();
-    const data = await massiveFetch(`/stocks/quotes/${sym}`);
+    const sym = req.params.symbol.toUpperCase();
+    const url = `${MASSIVE_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/${sym}?apiKey=${MASSIVE_KEY}`;
+    const r   = await fetch(url, { headers: { "Authorization": `Bearer ${MASSIVE_KEY}` } });
+    if (!r.ok) throw new Error(`Massive ${r.status}: ${await r.text()}`);
+    const data = await r.json();
+    const s = data.ticker || data;
 
     res.json({
       ok: true,
       data: {
         sym,
-        price:         data.price         || data.lastPrice  || null,
-        open:          data.open           || null,
-        prevClose:     data.prevClose      || data.previousClose || null,
-        high:          data.high           || null,
-        low:           data.low            || null,
-        volume:        data.volume         || null,
-        changePercent: data.changePercent  || null,
-        rvol:          data.rvol           || data.relativeVolume || null,
-        marketCap:     data.marketCap      || null,
-        float:         data.float          || null,
+        price:         s.lastTrade?.p || s.day?.c || null,
+        open:          s.day?.o       || null,
+        prevClose:     s.prevDay?.c   || null,
+        high:          s.day?.h       || null,
+        low:           s.day?.l       || null,
+        volume:        s.day?.v       || null,
+        changePercent: s.todaysChangePerc || null,
+        rvol:          null,
+        marketCap:     null,
+        float:         null,
       },
       timestamp: Date.now(),
     });
-
   } catch (err) {
     console.error(`GET /api/quote/${req.params.symbol} error:`, err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -156,46 +157,43 @@ app.get("/api/quote/:symbol", async (req, res) => {
 // ─────────────────────────────────────────────
 // ROUTE 3 — GET /api/pmh/:symbol
 // Premarket high painted detection.
-// Uses Massive 1-min OHLCV premarket data.
-// Returns pmhPrice, painted (bool), testCount.
+// Uses Massive 1-min aggregate bars.
 // ─────────────────────────────────────────────
 app.get("/api/pmh/:symbol", async (req, res) => {
   try {
     const sym   = req.params.symbol.toUpperCase();
     const today = etToday();
 
-    // 1-minute bars for premarket session (4:00am–9:30am ET)
-    const data = await massiveFetch(`/stocks/bars/${sym}`, {
-      date:       today,
-      resolution: "1",
-      session:    "premarket",
-    });
+    // Massive aggregate bars: /v2/aggs/ticker/{sym}/range/1/minute/{from}/{to}
+    // Premarket = 4:00am–9:30am ET = UTC 08:00–13:30
+    const fromMs = new Date(`${today}T08:00:00Z`).getTime();
+    const toMs   = new Date(`${today}T13:30:00Z`).getTime();
 
-    const bars = data.results || data.bars || data || [];
+    const url = `${MASSIVE_BASE}/v2/aggs/ticker/${sym}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=300&apiKey=${MASSIVE_KEY}`;
+    const r   = await fetch(url, { headers: { "Authorization": `Bearer ${MASSIVE_KEY}` } });
+    if (!r.ok) throw new Error(`Massive ${r.status}: ${await r.text()}`);
+    const data = await r.json();
+
+    const bars = data.results || [];
 
     if (!bars.length) {
       return res.json({ ok: true, data: { sym, painted: false, pmhPrice: null, testCount: 0 } });
     }
 
-    // Find the premarket high
-    const pmhPrice = Math.max(...bars.map(b => b.high || b.h || 0));
-    const pmhIndex = bars.findIndex(b => (b.high || b.h) === pmhPrice);
-    const threshold = pmhPrice * 0.985; // within 1.5%
+    const pmhPrice = Math.max(...bars.map(b => b.h || 0));
+    const pmhIndex = bars.findIndex(b => b.h === pmhPrice);
+    const threshold = pmhPrice * 0.985;
 
-    // Count bars AFTER the pmhIndex that came within 1.5% of the high
     const testCount = bars
       .slice(pmhIndex + 1)
-      .filter(b => (b.high || b.h || 0) >= threshold)
+      .filter(b => (b.h || 0) >= threshold)
       .length;
-
-    const painted = testCount >= 2;
 
     res.json({
       ok: true,
-      data: { sym, pmhPrice, painted, testCount },
+      data: { sym, pmhPrice, painted: testCount >= 2, testCount },
       timestamp: Date.now(),
     });
-
   } catch (err) {
     console.error(`GET /api/pmh/${req.params.symbol} error:`, err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -204,72 +202,61 @@ app.get("/api/pmh/:symbol", async (req, res) => {
 
 // ─────────────────────────────────────────────
 // ROUTE 4 — GET /api/intraday/:symbol
-// 1-minute intraday bars for current session.
-// Used for: half-spike computation, MDP base
-// consolidation timer, RVOL calculation.
+// 1-minute regular session bars + MDP signals.
 // ─────────────────────────────────────────────
 app.get("/api/intraday/:symbol", async (req, res) => {
   try {
     const sym   = req.params.symbol.toUpperCase();
     const today = etToday();
 
-    const data = await massiveFetch(`/stocks/bars/${sym}`, {
-      date:       today,
-      resolution: "1",
-      session:    "regular",
-    });
+    // Regular session: 9:30am–4:00pm ET = UTC 13:30–20:00
+    const fromMs = new Date(`${today}T13:30:00Z`).getTime();
+    const toMs   = new Date(`${today}T20:00:00Z`).getTime();
 
-    const bars = (data.results || data.bars || data || []).map(b => ({
-      t:    b.timestamp || b.t,
-      open: b.open  || b.o,
-      high: b.high  || b.h,
-      low:  b.low   || b.l,
-      close:b.close || b.c,
-      vol:  b.volume|| b.v,
+    const url = `${MASSIVE_BASE}/v2/aggs/ticker/${sym}/range/1/minute/${fromMs}/${toMs}?adjusted=true&sort=asc&limit=400&apiKey=${MASSIVE_KEY}`;
+    const r   = await fetch(url, { headers: { "Authorization": `Bearer ${MASSIVE_KEY}` } });
+    if (!r.ok) throw new Error(`Massive ${r.status}: ${await r.text()}`);
+    const data = await r.json();
+
+    const bars = (data.results || []).map(b => ({
+      t: b.t, open: b.o, high: b.h, low: b.l, close: b.c, vol: b.v,
     }));
 
     if (!bars.length) {
       return res.json({ ok: true, data: { sym, bars: [], mdp: null } });
     }
 
-    // Compute MDP signals from bars
     const sessionOpen  = bars[0].open;
     const sessionHigh  = Math.max(...bars.map(b => b.high));
     const halfSpike    = sessionOpen + (sessionHigh - sessionOpen) / 2;
     const currentPrice = bars[bars.length - 1].close;
 
-    // Consolidation: find how many consecutive minutes price stayed
-    // within a 3% range ending at the current bar
+    // Consolidation: consecutive minutes within 3% range from current bar backwards
     let baseMinutes = 0;
-    const rangeThreshold = 0.03;
     for (let i = bars.length - 1; i >= 1; i--) {
-      const windowHigh = Math.max(...bars.slice(i - 1, bars.length).map(b => b.high));
-      const windowLow  = Math.min(...bars.slice(i - 1, bars.length).map(b => b.low));
-      if ((windowHigh - windowLow) / windowLow <= rangeThreshold) {
-        baseMinutes = bars.length - i + 1;
-      } else {
-        break;
-      }
+      const slice     = bars.slice(i - 1);
+      const wHigh     = Math.max(...slice.map(b => b.high));
+      const wLow      = Math.min(...slice.map(b => b.low));
+      if ((wHigh - wLow) / wLow <= 0.03) baseMinutes = bars.length - i + 1;
+      else break;
     }
 
     res.json({
       ok: true,
       data: {
-        sym,
-        bars,
+        sym, bars,
         mdp: {
           sessionOpen,
           sessionHigh,
-          halfSpike:     parseFloat(halfSpike.toFixed(4)),
+          halfSpike:      parseFloat(halfSpike.toFixed(4)),
           currentPrice,
-          aboveOpen:     currentPrice > sessionOpen,
-          aboveHalfSpike:currentPrice > halfSpike,
+          aboveOpen:      currentPrice > sessionOpen,
+          aboveHalfSpike: currentPrice > halfSpike,
           baseMinutes,
         }
       },
       timestamp: Date.now(),
     });
-
   } catch (err) {
     console.error(`GET /api/intraday/${req.params.symbol} error:`, err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -285,28 +272,23 @@ app.get("/api/rvol/:symbol", async (req, res) => {
     const sym   = req.params.symbol.toUpperCase();
     const today = etToday();
 
-    // Get today's volume
-    const quoteData = await massiveFetch(`/stocks/quotes/${sym}`);
-    const todayVol  = quoteData.volume || 0;
+    // Today's snapshot for current volume
+    const snapUrl = `${MASSIVE_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/${sym}?apiKey=${MASSIVE_KEY}`;
+    const snapR   = await fetch(snapUrl, { headers: { "Authorization": `Bearer ${MASSIVE_KEY}` } });
+    const snapData= await snapR.json();
+    const todayVol= snapData.ticker?.day?.v || 0;
 
-    // Get 30-day historical daily bars for average volume
-    const histData = await massiveFetch(`/stocks/bars/${sym}`, {
-      resolution: "D",
-      limit:      30,
-    });
-    const histBars = histData.results || histData.bars || histData || [];
-    const avgVol   = histBars.length
-      ? histBars.reduce((sum, b) => sum + (b.volume || b.v || 0), 0) / histBars.length
-      : 0;
+    // 30-day daily bars for average
+    const toDate   = today;
+    const fromDate = new Date(Date.now() - 30*86400000).toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+    const histUrl  = `${MASSIVE_BASE}/v2/aggs/ticker/${sym}/range/1/day/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=30&apiKey=${MASSIVE_KEY}`;
+    const histR    = await fetch(histUrl, { headers: { "Authorization": `Bearer ${MASSIVE_KEY}` } });
+    const histData = await histR.json();
+    const histBars = histData.results || [];
+    const avgVol   = histBars.length ? histBars.reduce((s,b)=>s+(b.v||0),0)/histBars.length : 0;
+    const rvol     = avgVol > 0 ? parseFloat((todayVol/avgVol).toFixed(1)) : null;
 
-    const rvol = avgVol > 0 ? parseFloat((todayVol / avgVol).toFixed(1)) : null;
-
-    res.json({
-      ok: true,
-      data: { sym, todayVol, avgVol: Math.round(avgVol), rvol },
-      timestamp: Date.now(),
-    });
-
+    res.json({ ok:true, data:{sym, todayVol, avgVol:Math.round(avgVol), rvol}, timestamp:Date.now() });
   } catch (err) {
     console.error(`GET /api/rvol/${req.params.symbol} error:`, err.message);
     res.status(500).json({ ok: false, error: err.message });
